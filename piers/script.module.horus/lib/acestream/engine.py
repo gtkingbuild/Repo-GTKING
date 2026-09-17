@@ -1,10 +1,10 @@
 import os
 import signal
 import subprocess
-import xbmcgui
 
 from threading import Thread
 from lib.acestream.object import Observable
+from lib.utils import no_window
 
 
 class Engine(Observable):
@@ -18,18 +18,33 @@ class Engine(Observable):
   def start(self, daemon=True, **kwargs):
     if not self.running:
       thread = Thread(target=self._start_process, kwargs=kwargs)
-      thread.setDaemon(daemon)
+      # setDaemon() was removed in Python 3.12
+      thread.daemon = daemon
       thread.start()
 
   def stop(self):
-    if self.process:
-      try:
-        os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-      except:
-        subprocess.call(['taskkill', '/F', '/T', '/PID', str(self.process.pid)])
+    # The process is launched in a thread that sets self.process to None when it
+    # ends, so a local reference avoids reading a None halfway through.
+    process = self.process
 
-      self.process = None
-      self.emit('terminated')
+    if not process:
+      return
+
+    try:
+      os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    except Exception:
+      try:
+        # Windows has no killpg. If taskkill is missing too (unix without setsid),
+        # fall back to Popen's own terminate() instead of propagating the error.
+        subprocess.call(['taskkill', '/F', '/T', '/PID', str(process.pid)], **no_window())
+      except Exception:
+        try:
+          process.terminate()
+        except Exception as error:
+          self.emit('error', str(error))
+
+    self.process = None
+    self.emit('terminated')
 
   @property
   def running(self):
@@ -37,7 +52,15 @@ class Engine(Observable):
 
   @property
   def process_args(self):
-    options = self.bin.split()
+    if isinstance(self.bin, (list, tuple)):
+      # Preferred form: the command already comes split. A path with spaces
+      # ("C:\\Users\\Juan Perez\\...") cannot be split on spaces, and the previous
+      # split() broke it in two, so the engine never started.
+      options = [str(a) for a in self.bin]
+    elif os.path.exists(self.bin):
+      options = [self.bin]
+    else:
+      options = self.bin.split()
 
     for (key, value) in self.options.items():
       options.append('--{0}'.format(key.replace('_', '-')))
@@ -51,7 +74,8 @@ class Engine(Observable):
     try:
       kwargs['preexec_fn'] = os.setsid
     except:
-      kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+      # CREATE_NO_WINDOW avoids the engine's black console over Kodi on Windows.
+      kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
     kwargs['stdout'] = subprocess.PIPE
     kwargs['stderr'] = subprocess.PIPE
